@@ -203,7 +203,8 @@ oc get gateway -n openshift-ingress
 oc get route data-science-gateway -n redhat-ods-applications -o jsonpath='{.spec.host}'
 
 # MaaS 테넌트
-oc get tenant -n models-as-a-service
+oc get maastenantconfig -n models-as-a-service
+oc get aitenant -n ai-tenants
 
 # Kuadrant 및 Authorino
 oc get kuadrant -n kuadrant-system
