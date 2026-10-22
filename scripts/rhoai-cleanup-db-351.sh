@@ -23,8 +23,8 @@
 # registered models in the Model Registry.
 #
 # After cleanup, re-run in order:
-#   1. rhoai-enable-all-features-351.sh   (or sno-...)  → PostgreSQL, MLflow, Model Registry
-#   2. rhoai-setup-maas-351.sh            (or sno-...)  → maas-db-config, maas-api restart
+#   1. rhoai-enable-all-features-351.sh or -352.sh   (or sno-...)  → PostgreSQL, MLflow, Model Registry
+#   2. rhoai-setup-maas-351.sh or -352.sh            (or sno-...)  → maas-db-config, maas-api restart
 #
 # Usage:
 #   bash rhoai-cleanup-db-351.sh --dry-run                 # show what would be deleted
@@ -185,9 +185,9 @@ echo "=============================================="
 success "Cleanup done."
 echo ""
 echo "  Re-apply in order:"
-echo "   1. rhoai-enable-all-features-351.sh  (SNO: sno-enable-all-features-351.sh)"
+echo "   1. rhoai-enable-all-features-351.sh or -352.sh  (SNO: sno-enable-all-features-351.sh)"
 echo "      → POC PostgreSQL, MLflow on PostgreSQL, Model Registry"
-echo "   2. rhoai-setup-maas-351.sh           (SNO: sno-setup-maas-351.sh)"
+echo "   2. rhoai-setup-maas-351.sh or -352.sh           (SNO: sno-setup-maas-351.sh)"
 echo "      → reuses PostgreSQL, recreates maas-db-config, restarts maas-api"
 echo "  Add --allow-other-version to both on RHOAI 3.5.2 clusters."
 echo "=============================================="

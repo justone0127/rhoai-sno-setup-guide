@@ -45,6 +45,7 @@
 #   bash rhoai-enable-all-features-351.sh                        # Full run (recommended)
 #   bash rhoai-enable-all-features-351.sh --skip-install         # Skip add-on operator install (Step 6)
 #   bash rhoai-enable-all-features-351.sh --allow-other-version  # Continue even if RHOAI != 3.5.1
+#   bash rhoai-enable-all-features-351.sh --with-devspaces      # Also install OpenShift Dev Spaces (off by default)
 #
 # Tip: In Web Terminal, run with nohup to survive disconnections:
 #   nohup bash rhoai-enable-all-features-351.sh > /tmp/rhoai-enable.log 2>&1 &
@@ -58,12 +59,14 @@ set -euo pipefail
 
 SKIP_INSTALL=false
 ALLOW_OTHER_VERSION=false
+WITH_DEVSPACES=false
 for arg in "$@"; do
     case "$arg" in
         --skip-install|--skip)  SKIP_INSTALL=true ;;
         --allow-other-version)  ALLOW_OTHER_VERSION=true ;;
+        --with-devspaces)       WITH_DEVSPACES=true ;;
         --help|-h)
-            sed -n '2,56p' "$0" 2>/dev/null || true
+            sed -n '2,57p' "$0" 2>/dev/null || true
             exit 0 ;;
         *) echo "Unknown option: $arg"; exit 1 ;;
     esac
@@ -1279,6 +1282,10 @@ echo ""
 #   Placed here (before Step 6) because Step 6 operator installs may briefly
 #   disrupt ingress/Web Terminal. DevSpaces needs a stable cluster state.
 ###############################################################################
+if [ "$WITH_DEVSPACES" != true ]; then
+    info "=== Step 5c: Red Hat OpenShift Dev Spaces [SKIPPED] (use --with-devspaces) ==="
+    echo ""
+else
 info "=== Step 5c: Red Hat OpenShift Dev Spaces ==="
 
 DEVSPACES_OPERATOR_NS="openshift-operators"
@@ -1412,6 +1419,8 @@ else
     fi
 fi
 echo ""
+
+fi
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 success "Core configuration complete (Steps 1-5c)."
@@ -2163,7 +2172,7 @@ echo "  • Workshop prep: see scripts/workshop-prep/"
 echo "    - create_workshop_users.sh    (htpasswd users + RBAC)"
 echo "    - gpu_machineset_hardwareprofiles.sh (MachineSet + HardwareProfile)"
 echo ""
-echo "  • DevSpaces dashboard: oc get checluster devspaces -n openshift-devspaces -o jsonpath='{.status.cheURL}'"
+echo "  • DevSpaces (--with-devspaces only): oc get checluster devspaces -n openshift-devspaces -o jsonpath='{.status.cheURL}'"
 echo ""
 echo "  • If some operators show ⬚, re-run this script."
 echo "    Operators installed by OLM continue in the background."

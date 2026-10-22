@@ -34,7 +34,7 @@
 #   curl ... | bash -s -- --yes
 #
 # After it finishes, re-run:
-#   1. rhoai-enable-all-features-351.sh   (installs RHOAI 3.5.1 in Step 0)
+#   1. rhoai-enable-all-features-351.sh or -352.sh   (Step 0 installs 3.5.1 or 3.5.2)
 #   2. rhoai-setup-maas-351.sh
 ###############################################################################
 set -uo pipefail
@@ -372,7 +372,7 @@ echo "=============================================="
 success "Uninstall finished."
 echo ""
 echo "  Re-install and verify:"
-echo "   1. rhoai-enable-all-features-351.sh   (Step 0 installs RHOAI 3.5.1)"
-echo "   2. rhoai-setup-maas-351.sh"
+echo "   1. rhoai-enable-all-features-351.sh or -352.sh   (Step 0 installs 3.5.1 or 3.5.2)"
+echo "   2. rhoai-setup-maas-351.sh (or -352.sh)"
 echo "  (SNO: sno-enable-all-features-351.sh / sno-setup-maas-351.sh)"
 echo "=============================================="
