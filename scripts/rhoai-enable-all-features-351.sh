@@ -505,10 +505,12 @@ echo ""
 #   - mlflow-db-credentials secret missing → (re)created every run
 #   - MLflow CR exists but migration stuck → deletes stuck job for retry
 #   - MLflow CR exists and healthy → skips
-#   - No PostgreSQL at all → falls back to SQLite
+#   - POC PostgreSQL is deployed in this step (before the MLflow CR), so
+#     MLflow starts on PostgreSQL; SQLite only if PostgreSQL is not ready
 #
-#   Note: Uses the existing 'maas' database for MLflow (the maas user does
-#   not have CREATEDB privilege). MLflow creates its own tables within it.
+#   Note: Uses the 'maas' database for MLflow (the maas user does not have
+#   CREATEDB privilege). MLflow creates its own tables within it. The MaaS
+#   setup script reuses the same PostgreSQL deployment.
 ###############################################################################
 info "=== Step 3/9: MLflow server + demo project ==="
 
@@ -525,6 +527,79 @@ fi
 oc label namespace demo opendatahub.io/dashboard=true --overwrite 2>/dev/null || true
 oc label namespace demo opendatahub.io/generated-namespace=true --overwrite 2>/dev/null || true
 success "demo labeled as Data Science Project"
+
+# --- POC PostgreSQL (shared by MLflow and MaaS) ---
+# Deployed here, BEFORE the MLflow CR, so MLflow starts on PostgreSQL
+# instead of SQLite. The MaaS setup script reuses this deployment
+# (it never re-applies it, so the password stays stable).
+if oc get deployment postgres -n "$MLFLOW_NS" &>/dev/null 2>&1; then
+    success "POC PostgreSQL already deployed in $MLFLOW_NS ✓"
+else
+    info "Deploying POC PostgreSQL in $MLFLOW_NS (NOT for production)..."
+    PG_POC_USER="maas"
+    PG_POC_DB="maas"
+    PG_POC_PASSWORD="$(openssl rand -base64 32 | tr -d '/+=' | cut -c1-32)"
+    PG_POC_IMAGE=$(oc get csv -l 'olm.copiedFrom=redhat-ods-operator' \
+        -o jsonpath='{.items[0].spec.relatedImages[?(@.name=="postgresql_16_image")].image}' 2>/dev/null) || true
+    [ -z "$PG_POC_IMAGE" ] && PG_POC_IMAGE="registry.redhat.io/rhel9/postgresql-16:latest"
+    info "PostgreSQL image: $PG_POC_IMAGE"
+    oc apply -n "$MLFLOW_NS" -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  labels: { app: postgres, purpose: poc }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 20Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels: { app: postgres }
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432, targetPort: 5432 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels: { app: postgres, purpose: poc }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata: { labels: { app: postgres } }
+    spec:
+      containers:
+      - name: postgres
+        image: ${PG_POC_IMAGE}
+        ports: [{ containerPort: 5432 }]
+        env:
+        - { name: POSTGRESQL_USER, value: "${PG_POC_USER}" }
+        - { name: POSTGRESQL_PASSWORD, value: "${PG_POC_PASSWORD}" }
+        - { name: POSTGRESQL_DATABASE, value: "${PG_POC_DB}" }
+        volumeMounts: [{ name: data, mountPath: /var/lib/pgsql/data }]
+        resources:
+          requests: { cpu: 250m, memory: 512Mi }
+          limits: { cpu: "1", memory: 1Gi }
+        readinessProbe:
+          exec: { command: ["pg_isready", "-U", "${PG_POC_USER}", "-d", "${PG_POC_DB}"] }
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: data
+        persistentVolumeClaim: { claimName: postgres-data }
+EOF
+    unset PG_POC_PASSWORD
+    info "Waiting for PostgreSQL (up to 180s)..."
+    oc rollout status deployment/postgres -n "$MLFLOW_NS" --timeout=180s &>/dev/null \
+        && success "POC PostgreSQL ready ✓" \
+        || warn "PostgreSQL not ready yet — MLflow falls back to SQLite if it is still not ready below"
+fi
 
 # Wait for MLflow CRD (registered after mlflowoperator becomes Managed)
 info "Waiting for MLflow CRD..."
@@ -769,8 +844,7 @@ if oc get crd evalhubs.trustyai.opendatahub.io &>/dev/null 2>&1; then
     if oc get evalhub evalhub -n "$EVALHUB_NS" &>/dev/null 2>&1; then
         success "EvalHub already exists in $EVALHUB_NS ✓"
     else
-        # SQLite is sufficient for the demo — no DB secrets or RBAC to PostgreSQL needed.
-        # PostgreSQL is deployed later by rhoai-setup-maas-351.sh, so it won't exist here anyway.
+        # SQLite is sufficient for EvalHub in the demo — no DB secrets or RBAC to PostgreSQL needed.
         info "Creating EvalHub (SQLite backend — lightweight for demo)..."
         oc apply -f - <<EOF
 apiVersion: trustyai.opendatahub.io/v1alpha1
@@ -941,6 +1015,62 @@ EOF
     success "EvalHub RBAC configured for demo namespace"
 else
     warn "EvalHub CRD not available yet — EvalHub will be created on next run"
+fi
+echo ""
+
+# --- Step 3c: Model Registry instance ---
+# The Model Registry operator provisions a dedicated PostgreSQL for the
+# registry (postgres.generateDeployment=true), so this does not depend on
+# the POC PostgreSQL above.
+MR_CRD="modelregistries.modelregistry.opendatahub.io"
+MR_NAME="${MODEL_REGISTRY_NAME:-default-registry}"
+info "=== Step 3c: Model Registry instance ==="
+WAIT=0
+while ! oc get crd "$MR_CRD" &>/dev/null 2>&1; do
+    [ $WAIT -ge 120 ] && break
+    sleep 10; WAIT=$((WAIT + 10))
+done
+if ! oc get crd "$MR_CRD" &>/dev/null 2>&1; then
+    warn "ModelRegistry CRD not ready yet — registry will be created on next run"
+else
+    MR_NS=$(oc get datasciencecluster default-dsc \
+        -o jsonpath='{.spec.components.modelregistry.registriesNamespace}' 2>/dev/null || true)
+    MR_NS="${MR_NS:-rhoai-model-registries}"
+    WAIT=0
+    while ! oc get ns "$MR_NS" &>/dev/null 2>&1; do
+        [ $WAIT -ge 120 ] && break
+        sleep 10; WAIT=$((WAIT + 10))
+    done
+    if ! oc get ns "$MR_NS" &>/dev/null 2>&1; then
+        warn "Registries namespace $MR_NS not created yet — registry will be created on next run"
+    elif oc get "$MR_CRD" "$MR_NAME" -n "$MR_NS" &>/dev/null 2>&1; then
+        success "ModelRegistry ${MR_NS}/${MR_NAME} already exists ✓"
+    else
+        info "Creating ModelRegistry ${MR_NS}/${MR_NAME} (operator-provisioned PostgreSQL)..."
+        oc apply -f - <<EOF
+apiVersion: modelregistry.opendatahub.io/v1beta1
+kind: ModelRegistry
+metadata:
+  name: ${MR_NAME}
+  namespace: ${MR_NS}
+spec:
+  grpc: {}
+  rest: {}
+  kubeRBACProxy: {}
+  postgres:
+    generateDeployment: true
+EOF
+        info "Waiting for ModelRegistry (up to 5 min)..."
+        WAIT=0; MR_AVAILABLE=""
+        while [ $WAIT -lt 300 ]; do
+            MR_AVAILABLE=$(oc get "$MR_CRD" "$MR_NAME" -n "$MR_NS" \
+                -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)
+            [ "$MR_AVAILABLE" = "True" ] && break
+            sleep 15; WAIT=$((WAIT + 15))
+        done
+        [ "$MR_AVAILABLE" = "True" ] && success "ModelRegistry ${MR_NAME} Available ✓" || \
+            warn "ModelRegistry not Available yet (will reconcile in background) — oc get pods -n ${MR_NS}"
+    fi
 fi
 echo ""
 
@@ -1995,6 +2125,16 @@ MLFLOW_READY=$(oc get mlflow mlflow -o jsonpath='{.status.conditions[?(@.type=="
 [ "$MLFLOW_READY" = "True" ] && echo "  ✅ MLflow server" || echo "  ⬚  MLflow server"
 EVALHUB_PHASE=$(oc get evalhub evalhub -n redhat-ods-applications -o jsonpath='{.status.phase}' 2>/dev/null || true)
 [ "$EVALHUB_PHASE" = "Ready" ] && echo "  ✅ EvalHub" || echo "  ⬚  EvalHub (${EVALHUB_PHASE:-not deployed})"
+MLFLOW_DB=$(oc get mlflow mlflow -o jsonpath='{.spec.backendStoreUriFrom.name}' 2>/dev/null || true)
+[ -n "$MLFLOW_DB" ] && echo "  ✅ MLflow backend: PostgreSQL (secret ${MLFLOW_DB})" || echo "  ⚠️  MLflow backend: SQLite"
+PG_OK=$(oc get deployment postgres -n redhat-ods-applications -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
+[ "${PG_OK:-0}" = "1" ] && echo "  ✅ POC PostgreSQL (redhat-ods-applications)" || echo "  ⬚  POC PostgreSQL"
+MR_NS_V=$(oc get datasciencecluster default-dsc -o jsonpath='{.spec.components.modelregistry.registriesNamespace}' 2>/dev/null || true)
+MR_NS_V="${MR_NS_V:-rhoai-model-registries}"
+MR_V=$(oc get modelregistries.modelregistry.opendatahub.io "${MODEL_REGISTRY_NAME:-default-registry}" -n "$MR_NS_V" \
+    -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)
+[ "$MR_V" = "True" ] && echo "  ✅ Model Registry ${MR_NS_V}/${MODEL_REGISTRY_NAME:-default-registry}" \
+                    || echo "  ⬚  Model Registry (${MR_V:-not ready})"
 
 echo ""
 info "Gateway:"

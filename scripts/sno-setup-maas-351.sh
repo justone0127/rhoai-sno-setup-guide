@@ -279,12 +279,22 @@ elif [ -n "$POSTGRES_CONNECTION" ]; then
         oc apply -n "$MAAS_INFRA_NS" -f -
     success "maas-db-config created in $MAAS_INFRA_NS (external DB)"
 else
+    PG_USER="maas"
+    PG_DB="maas"
+    if oc get deployment postgres -n "$PG_DEPLOY_NS" &>/dev/null 2>&1; then
+        # Deployed by *-enable-all-features-351.sh (shared with MLflow).
+        # Never re-apply it: a new random password would break MLflow.
+        success "POC PostgreSQL already deployed in $PG_DEPLOY_NS — reusing it ✓"
+        PG_USER=$(oc get deployment postgres -n "$PG_DEPLOY_NS" \
+            -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="POSTGRESQL_USER")].value}' 2>/dev/null)
+        PG_DB=$(oc get deployment postgres -n "$PG_DEPLOY_NS" \
+            -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="POSTGRESQL_DATABASE")].value}' 2>/dev/null)
+        PG_USER="${PG_USER:-maas}"; PG_DB="${PG_DB:-maas}"
+    else
     warn "No --postgres-connection provided. Deploying POC PostgreSQL (NOT for production)."
     info "For production: AWS RDS, Crunchy Operator, or Azure Database for PostgreSQL"
     echo ""
 
-    PG_USER="maas"
-    PG_DB="maas"
     PG_PASSWORD="$(openssl rand -base64 32 | tr -d '/+=' | cut -c1-32)"
 
     # Resolve PostgreSQL image from RHOAI operator CSV
@@ -356,6 +366,7 @@ spec:
 EOF
     fi
     unset PG_PASSWORD
+    fi
 
     info "Waiting for PostgreSQL..."
     WAIT=0
