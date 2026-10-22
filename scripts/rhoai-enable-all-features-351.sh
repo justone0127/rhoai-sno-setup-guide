@@ -118,29 +118,36 @@ install_operator() {
 
     info "Installing ${DISPLAY_NAME} (ns=${NAMESPACE}, ch=${CHANNEL}, mode=${MODE})..."
 
-    if [ "$MODE" = "skip" ]; then
-        # openshift-operators: already has Namespace + OperatorGroup
-        oc apply -f - <<EOF
-apiVersion: operators.coreos.com/v1alpha1
-kind: Subscription
-metadata:
-  name: ${SUB_NAME}
-  namespace: ${NAMESPACE}
-spec:
-  channel: ${CHANNEL}
-  installPlanApproval: Automatic
-  name: ${SUB_NAME}
-  source: redhat-operators
-  sourceNamespace: openshift-marketplace
-EOF
-    elif [ "$MODE" = "all" ]; then
-        # AllNamespaces mode: OperatorGroup WITHOUT targetNamespaces (e.g. RHCL)
-        oc apply -f - <<EOF
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: ${NAMESPACE}
----
+    # Reuse an existing Subscription for this package (possibly created by the
+    # console/RHDP under another name) — a second one breaks OLM resolution.
+    local EXISTING_SUB
+    EXISTING_SUB=$(oc get sub -n "$NAMESPACE" -o go-template='{{range .items}}{{if eq .spec.name "'"$SUB_NAME"'"}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' 2>/dev/null | head -1 || true)
+    if [ -n "$EXISTING_SUB" ]; then
+        success "${DISPLAY_NAME}: Subscription ${EXISTING_SUB} already exists in ${NAMESPACE} — not creating another"
+        local OG_EXISTING
+        OG_EXISTING=$(oc get operatorgroup -n "$NAMESPACE" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$MODE" != "skip" ] && [ "${OG_EXISTING:-0}" -ge 2 ]; then
+            warn "${NAMESPACE} has ${OG_EXISTING} OperatorGroups — CSV cannot install. Delete all but one:"
+            oc get operatorgroup -n "$NAMESPACE" --no-headers 2>/dev/null | sed 's/^/      /'
+        fi
+        return 0
+    fi
+
+    if [ "$MODE" != "skip" ]; then
+        oc create namespace "$NAMESPACE" 2>/dev/null || true
+        # Exactly one OperatorGroup per namespace. If one already exists
+        # (e.g. operator pre-installed via console/RHDP), reuse it — a second
+        # OperatorGroup makes the CSV fail with "multiple operatorgroups".
+        local OG_COUNT
+        OG_COUNT=$(oc get operatorgroup -n "$NAMESPACE" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+        if [ "${OG_COUNT:-0}" -ge 2 ]; then
+            warn "${NAMESPACE} has ${OG_COUNT} OperatorGroups — OLM will not install. Delete all but one:"
+            oc get operatorgroup -n "$NAMESPACE" --no-headers 2>/dev/null | sed 's/^/      /'
+        elif [ "${OG_COUNT:-0}" -eq 1 ]; then
+            info "Reusing existing OperatorGroup in ${NAMESPACE}"
+        elif [ "$MODE" = "all" ]; then
+            # AllNamespaces mode: OperatorGroup WITHOUT targetNamespaces (e.g. RHCL)
+            oc apply -f - <<EOF
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
 metadata:
@@ -148,27 +155,10 @@ metadata:
   namespace: ${NAMESPACE}
 spec:
   upgradeStrategy: Default
----
-apiVersion: operators.coreos.com/v1alpha1
-kind: Subscription
-metadata:
-  name: ${SUB_NAME}
-  namespace: ${NAMESPACE}
-spec:
-  channel: ${CHANNEL}
-  installPlanApproval: Automatic
-  name: ${SUB_NAME}
-  source: redhat-operators
-  sourceNamespace: openshift-marketplace
 EOF
-    else
-        # OwnNamespace mode: OperatorGroup WITH targetNamespaces (e.g. LWS, cert-manager)
-        oc apply -f - <<EOF
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: ${NAMESPACE}
----
+        else
+            # OwnNamespace mode: OperatorGroup WITH targetNamespaces (e.g. LWS, cert-manager)
+            oc apply -f - <<EOF
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
 metadata:
@@ -178,7 +168,12 @@ spec:
   targetNamespaces:
   - ${NAMESPACE}
   upgradeStrategy: Default
----
+EOF
+        fi
+    fi
+    # skip mode: openshift-operators already has Namespace + OperatorGroup
+
+    oc apply -f - <<EOF
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata:
@@ -191,7 +186,6 @@ spec:
   source: redhat-operators
   sourceNamespace: openshift-marketplace
 EOF
-    fi
 }
 
 ###############################################################################
