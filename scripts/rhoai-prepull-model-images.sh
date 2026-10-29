@@ -91,11 +91,14 @@ print_pods() {
 
 wait_ready() {
     local START=$SECONDS STATE DESIRED READY
+    local PULLING
     info "Waiting until every node has pulled the image(s) (timeout ${TIMEOUT}s)..."
+    info "Nodes pull in parallel (~4-5 min for 16GB), so most finish at about the same time."
     while true; do
         STATE=$(show_status)
         READY=${STATE%/*}; DESIRED=${STATE#*/}
-        echo -e "  [$(( (SECONDS - START) / 60 ))m$(( (SECONDS - START) % 60 ))s] ready nodes: ${STATE}"
+        PULLING=$(oc get pods -n "$NAMESPACE" -l app="$NAME" --no-headers 2>/dev/null | grep -c ContainerCreating || true)
+        echo -e "  [$(( (SECONDS - START) / 60 ))m$(( (SECONDS - START) % 60 ))s] ready nodes: ${STATE}  (pulling: ${PULLING})"
         if [ "$DESIRED" -gt 0 ] && [ "$READY" -eq "$DESIRED" ]; then
             success "All ${DESIRED} node(s) have the image(s)"
             return 0
