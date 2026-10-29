@@ -210,3 +210,9 @@ oc get aitenant -n ai-tenants
 oc get kuadrant -n kuadrant-system
 oc get authorino -n kuadrant-system
 ```
+## 3.5.2 배포 및 워크샵 환경 세팅
+
+BASE=https://raw.githubusercontent.com/justone0127/rhoai-sno-setup-guide/main/scripts
+curl -sL $BASE/rhoai-enable-all-features-352.sh | bash 2>&1 | tee enable.log
+curl -sL $BASE/rhoai-setup-maas-352.sh | bash 2>&1 | tee maas.log
+
