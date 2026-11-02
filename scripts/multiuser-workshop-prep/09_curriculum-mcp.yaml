@@ -11,7 +11,7 @@ metadata:
     app: curriculum-mcp
 data:
   server.py: |
-    """인공지능공학전공 교육과정 조회 MCP 서버 (Streamable HTTP)."""
+    """조선대학교 인공지능공학전공 교육과정 조회 MCP 서버 (Streamable HTTP)."""
     import json
     import os
     from collections import defaultdict
