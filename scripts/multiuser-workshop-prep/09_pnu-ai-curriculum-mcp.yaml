@@ -1,0 +1,1271 @@
+# 부산대학교 인공지능학부 교육과정 조회 MCP 서버 (2026학년도)
+# 공용 서버: 클러스터에 1개만 배포하고 모든 수강생이 함께 사용합니다.
+# 배포: bash 11_deploy-curriculum-mcp.sh --mcp pnu-ai-curriculum-mcp
+# 접속: http://pnu-ai-curriculum-mcp.mcp-servers.svc.cluster.local:8000/mcp
+# 출처: 2026교육과정표(인공지능전공).hwp
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pnu-ai-curriculum-mcp-src
+  labels:
+    app: pnu-ai-curriculum-mcp
+data:
+  server.py: |
+    """부산대학교 교육과정 조회 MCP 서버 (Streamable HTTP)."""
+    import json
+    import os
+    from collections import defaultdict
+
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    DATA_FILE = os.environ.get("CURRICULUM_FILE", os.path.join(os.path.dirname(__file__), "curriculum.json"))
+    with open(DATA_FILE, encoding="utf-8") as f:
+        DATA = json.load(f)
+
+    META = DATA["meta"]
+    COURSES = DATA["courses"]
+    CATEGORIES = list(dict.fromkeys(c["category"] for c in COURSES))
+    TITLE = f"{META['university']} {META['major']} ({META['year']}학년도)"
+
+    mcp = MCPServer(
+        name=META["server_name"],
+        instructions=(
+            f"{TITLE} 교육과정(학년/학기별 개설 과목, 이수구분, 학점, 강의·실습 시간, 졸업기준 학점, "
+            "최소·심화·부전공 이수 규칙)을 조회하는 도구입니다. 교육과정에 관한 질문은 추측하지 말고 이 도구로 확인하세요."
+        ),
+    )
+
+
+    def _num(x: float) -> str:
+        return str(int(x)) if x == int(x) else str(x)
+
+
+    def _when(c: dict) -> str:
+        grade = "전학년" if c["grade"] is None else f"{c['grade']}학년"
+        sems = ",".join(f"{s}학기" if isinstance(s, int) else str(s) for s in c["semesters"])
+        return f"{grade} {sems}"
+
+
+    def _fmt(c: dict) -> str:
+        marks = []
+        if c.get("minimum_major_required"):
+            marks.append("최소전공 필수")
+        if c.get("minor_required"):
+            marks.append("부전공 필수")
+        extra = f" | {', '.join(marks)}" if marks else ""
+        area = f" | {c['liberal_area']}" if c.get("liberal_area") else ""
+        return (f"- {_when(c)} | {c['category']} | {c['name_ko']} ({c['name_en']}) [{c['code']}] | "
+                f"{_num(c['credits'])}학점 | 강의 {_num(c['lecture_hours'])}시간, 실습 {_num(c['practice_hours'])}시간"
+                f"{area}{extra}")
+
+
+    def _norm(s: str) -> str:
+        return "".join(s.split()).lower()
+
+
+    def _match(c: dict, grade: int | None, semester: int | None) -> bool:
+        # 전학년 과목은 어느 학년 조회에도 포함
+        return ((grade is None or c["grade"] is None or c["grade"] == grade)
+                and (semester is None or semester in c["semesters"]))
+
+
+    @mcp.tool()
+    def search_courses(keyword: str) -> str:
+        """과목명(국문 또는 영문) 또는 교과목 번호로 과목을 찾습니다.
+        과목이 몇 학년 몇 학기에 개설되는지, 몇 학점인지, 이수구분이 무엇인지 확인할 때 사용합니다.
+
+        Args:
+            keyword: 찾을 과목명 또는 그 일부, 또는 교과목 번호 (예: "딥러닝", "cloud", "CA2001621")
+        """
+        k = _norm(keyword)
+        hits = [c for c in COURSES
+                if k in _norm(c["name_ko"]) or k in _norm(c["name_en"]) or k in c["code"].lower()]
+        if not hits:
+            return f"'{keyword}'(이)가 포함된 과목이 교육과정에 없습니다."
+        return f"'{keyword}' 검색 결과 {len(hits)}개 과목:\n" + "\n".join(_fmt(c) for c in hits)
+
+
+    @mcp.tool()
+    def list_courses(grade: int | None = None, semester: int | None = None, category: str | None = None,
+                     required_for: str | None = None) -> str:
+        """조건에 맞는 과목 목록을 반환합니다. 조건을 생략하면 해당 조건은 전체로 간주합니다.
+        '전학년' 개설 과목은 학년 조건과 관계없이 포함됩니다.
+
+        Args:
+            grade: 학년 (1~4)
+            semester: 학기 (1 또는 2)
+            category: 이수구분. 효원핵심교양, 기초교양, 전공기초, 전공필수, 전공선택 중 하나
+            required_for: "부전공" 또는 "최소전공" — 해당 과정의 필수 표시(◎, ♤) 과목만 조회
+        """
+        if category and category not in CATEGORIES:
+            return f"알 수 없는 이수구분입니다: {category}. 사용 가능한 값: {', '.join(CATEGORIES)}"
+        flag = {"부전공": "minor_required", "최소전공": "minimum_major_required", "복수전공": "minimum_major_required"}
+        if required_for and required_for not in flag:
+            return "required_for 값은 '부전공' 또는 '최소전공' 중 하나여야 합니다."
+        hits = [c for c in COURSES
+                if _match(c, grade, semester)
+                and (category is None or c["category"] == category)
+                and (required_for is None or c.get(flag[required_for]))]
+        cond = " ".join(x for x in [f"{grade}학년" if grade else "", f"{semester}학기" if semester else "",
+                                    category or "", f"{required_for} 필수" if required_for else ""] if x) or "전체"
+        if not hits:
+            msg = f"조건({cond})에 맞는 과목이 없습니다."
+            if required_for == "최소전공" and not any(c.get("minimum_major_required") for c in COURSES):
+                msg += " 이 전공은 최소전공 필수 표시(♤)를 따로 두지 않습니다. get_graduation_requirements로 규칙을 확인하세요."
+            return msg
+        total = sum(c["credits"] for c in hits)
+        return f"조건({cond})에 맞는 과목 {len(hits)}개, 합계 {_num(total)}학점:\n" + "\n".join(_fmt(c) for c in hits)
+
+
+    @mcp.tool()
+    def credit_summary(grade: int | None = None, semester: int | None = None) -> str:
+        """개설 과목 수와 학점 합계를 이수구분별로 집계합니다.
+        이 값은 개설된 과목의 합계이며 졸업 이수 학점이 아닙니다 (졸업 기준은 get_graduation_requirements).
+
+        Args:
+            grade: 학년 (1~4). 생략하면 전체 학년
+            semester: 학기 (1 또는 2). 생략하면 전체 학기
+        """
+        hits = [c for c in COURSES if _match(c, grade, semester)]
+        if not hits:
+            return "조건에 맞는 과목이 없습니다."
+        by = defaultdict(lambda: [0, 0.0])
+        for c in hits:
+            by[c["category"]][0] += 1
+            by[c["category"]][1] += c["credits"]
+        scope = " ".join(x for x in [f"{grade}학년" if grade else "", f"{semester}학기" if semester else ""] if x) or "전체"
+        lines = [f"{scope}: 총 {len(hits)}개 과목, {_num(sum(c['credits'] for c in hits))}학점 (개설 과목 합계이며 졸업 학점 아님)"]
+        lines += [f"- {k}: {by[k][0]}개 과목, {_num(by[k][1])}학점" for k in CATEGORIES if k in by]
+        return "\n".join(lines)
+
+
+    @mcp.tool()
+    def get_graduation_requirements() -> str:
+        """졸업기준 학점(영역별), 최소전공·심화전공·부전공 이수 규칙, 교양 영역 이수 조건,
+        복수전공·부전공·연계전공·교직 이수 학점을 반환합니다.
+        '졸업하려면 몇 학점', '부전공 하려면', '심화전공 조건' 같은 질문에 사용합니다.
+        """
+        r = DATA["requirements"]
+        lines = [f"[{TITLE}] 졸업기준 {r['total']}학점", "", "■ 영역별 졸업기준 학점"]
+        lines += [f"- {k}: {v}" for k, v in r["by_area"].items()]
+        lines += ["", "■ 전공 이수 규칙"] + [f"- {x}" for x in r["major_rules"]]
+        lines += ["", "■ 교양 이수 조건"] + [f"- {x}" for x in r["liberal_rules"]]
+        for cat in ("효원균형교양", "효원창의교양"):
+            areas = [a["area"] for a in DATA["liberal_areas"] if a["category"] == cat]
+            lines.append(f"- {cat} 영역: {', '.join(areas)}")
+        lines += ["", "■ " + r["other_majors_note"]]
+        lines += [f"- {k}: {v}학점" for k, v in r["other_majors"].items()]
+        lines += ["", "범례: " + META["legend"]]
+        return "\n".join(lines)
+
+
+    if __name__ == "__main__":
+        mcp.run(
+            transport="streamable-http",
+            host="0.0.0.0",
+            port=int(os.environ.get("PORT", "8000")),
+            stateless_http=True,
+            json_response=True,
+            # 클러스터 내부 Service DNS 이름으로 접근하므로 DNS rebinding 보호를 끕니다 (실습용)
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        )
+  curriculum.json: |
+    {
+     "meta": {
+      "server_name": "pnu-ai-curriculum",
+      "university": "부산대학교",
+      "major": "인공지능학부",
+      "year": 2026,
+      "legend": "◎ 부전공 필수과목"
+     },
+     "requirements": {
+      "total": 133,
+      "by_area": {
+       "효원핵심교양": "10학점",
+       "효원균형교양": "9학점 (기초교양 3학점 포함)",
+       "효원창의교양": "6학점",
+       "최소전공 - 전공기초": "14학점",
+       "최소전공 - 전공일반": "37학점 (전공필수)",
+       "심화전공": "51학점 (전공선택 51학점)",
+       "일반선택": "6학점"
+      },
+      "major_rules": [
+       "최소(복수)전공: 전공기초, 전공필수 과목 전부 이수",
+       "심화전공: 전공기초와 전공필수과목 전부, 전공선택 51학점 (전공기초 14학점, 전공필수 37학점, 전공선택 51학점)",
+       "부전공: ◎과목을 포함하여 전공기초/전공필수 과목 21학점"
+      ],
+      "liberal_rules": [
+       "효원균형교양: 최소 2개 영역에서 2과목 이수",
+       "효원창의교양: 최소 2개 영역에서 2과목 이수"
+      ],
+      "other_majors_note": "심화전공을 선택하지 않은 학생은 다음 중 하나의 전공을 반드시 이수해야 한다 (전 학과(부) 공통사항)",
+      "other_majors": {
+       "복수전공": "42~72",
+       "부전공": "21",
+       "연계전공": "48~57",
+       "교직": "22"
+      }
+     },
+     "courses": [
+      {
+       "code": "ZE1000113",
+       "area": "교양",
+       "category": "효원핵심교양",
+       "name_ko": "대학영어",
+       "name_en": "College English",
+       "credits": 2.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 1,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "ZE1000453",
+       "area": "교양",
+       "category": "효원핵심교양",
+       "name_ko": "인공지능과디지털사고",
+       "name_en": "Artificial Intelligence and Digital Thinking",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 1,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "ZE1000091",
+       "area": "교양",
+       "category": "효원핵심교양",
+       "name_ko": "고전 읽기와 토론",
+       "name_en": "Reading Classics of Great Literature",
+       "credits": 2.0,
+       "lecture_hours": 2.0,
+       "practice_hours": 0.0,
+       "grade": 1,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CB1000119",
+       "area": "교양",
+       "category": "효원핵심교양",
+       "name_ko": "공학작문및발표",
+       "name_en": "Technical Writing & Presentation",
+       "credits": 3.0,
+       "lecture_hours": 2.0,
+       "practice_hours": 2.0,
+       "grade": 3,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "ZF1500697",
+       "area": "교양",
+       "category": "기초교양",
+       "name_ko": "공학미적분학",
+       "name_en": "Calculus in Engineering",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 1,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false,
+       "liberal_area": "Ⅳ. ‘과학과 기술’ 영역"
+      },
+      {
+       "code": "CA1501006",
+       "area": "전공",
+       "category": "전공기초",
+       "name_ko": "이산수학",
+       "name_en": "Discrete Mathematics",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 1,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA1501028",
+       "area": "전공",
+       "category": "전공기초",
+       "name_ko": "컴퓨터및프로그래밍입문",
+       "name_en": "Introduction to Computers and Programming",
+       "credits": 4.0,
+       "lecture_hours": 4.0,
+       "practice_hours": 0.0,
+       "grade": 1,
+       "semesters": [
+        1
+       ],
+       "minor_required": true,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA1501029",
+       "area": "전공",
+       "category": "전공기초",
+       "name_ko": "확률통계",
+       "name_en": "Probabilities and Statistics",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 1,
+       "semesters": [
+        2
+       ],
+       "minor_required": true,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA1501030",
+       "area": "전공",
+       "category": "전공기초",
+       "name_ko": "프로그래밍원리와실습",
+       "name_en": "Programming Principles and Practice",
+       "credits": 4.0,
+       "lecture_hours": 4.0,
+       "practice_hours": 0.0,
+       "grade": 1,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001141",
+       "area": "전공",
+       "category": "전공필수",
+       "name_ko": "인터넷과웹기초",
+       "name_en": "Introduction to Internet and Web",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 1,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001142",
+       "area": "전공",
+       "category": "전공필수",
+       "name_ko": "공학선형대수학",
+       "name_en": "Engineering Linear Algebra",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 1,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001144",
+       "area": "전공",
+       "category": "전공필수",
+       "name_ko": "C++프로그래밍과실습",
+       "name_en": "C++ Programming and Practice",
+       "credits": 4.0,
+       "lecture_hours": 4.0,
+       "practice_hours": 0.0,
+       "grade": 2,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001145",
+       "area": "전공",
+       "category": "전공필수",
+       "name_ko": "데이터과학입문",
+       "name_en": "Introduction to Data Science",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 2,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001146",
+       "area": "전공",
+       "category": "전공필수",
+       "name_ko": "인공지능수학",
+       "name_en": "Mathematics for Artificial Intelligence",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 2,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001147",
+       "area": "전공",
+       "category": "전공필수",
+       "name_ko": "자료구조",
+       "name_en": "Data Structures",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 2,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001627",
+       "area": "전공",
+       "category": "전공필수",
+       "name_ko": "인공지능개론",
+       "name_en": "Introduction to Artificial Intelligence",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 2,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001143",
+       "area": "전공",
+       "category": "전공필수",
+       "name_ko": "AI프로그래밍",
+       "name_en": "AI Programming",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 2,
+       "semesters": [
+        2
+       ],
+       "minor_required": true,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001150",
+       "area": "전공",
+       "category": "전공필수",
+       "name_ko": "머신러닝",
+       "name_en": "Machine Learning",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 3,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001149",
+       "area": "전공",
+       "category": "전공필수",
+       "name_ko": "컴퓨터알고리즘",
+       "name_en": "Computer Algorithms",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 3,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001151",
+       "area": "전공",
+       "category": "전공필수",
+       "name_ko": "인공지능세미나특강",
+       "name_en": "Artificial Intelligence Seminar",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 3,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001152",
+       "area": "전공",
+       "category": "전공필수",
+       "name_ko": "캡스톤디자인",
+       "name_en": "Capstone Design",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 4,
+       "semesters": [
+        1,
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001153",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "어드벤처디자인",
+       "name_en": "Adventure Design",
+       "credits": 2.0,
+       "lecture_hours": 0.0,
+       "practice_hours": 4.0,
+       "grade": 1,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001154",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "전기전자공학개론",
+       "name_en": "Introduction to Electric and Electronic Engineering",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 1,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001155",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "논리회로및설계",
+       "name_en": "Logic Circuit Design",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 2,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001156",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "시스템소프트웨어",
+       "name_en": "System Software",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 2,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001157",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "유닉스기초",
+       "name_en": "Introduction to Unix Programming",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 2,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001158",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "논리회로설계및실험",
+       "name_en": "Logic Circuit design & Lab",
+       "credits": 2.0,
+       "lecture_hours": 0.0,
+       "practice_hours": 4.0,
+       "grade": 2,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001159",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "웹응용프로그래밍",
+       "name_en": "Web Application Programming",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 2,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001166",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "컴퓨터구조",
+       "name_en": "Computer Architecture",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 2,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001160",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "플랫폼기반프로그래밍",
+       "name_en": "Platform-based Programming",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 2,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001162",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "데이터통신",
+       "name_en": "Data Communications",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 3,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001163",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "실감미디어프로그래밍",
+       "name_en": "Immersive Media Programming",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 3,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001164",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "운영체제",
+       "name_en": "Operating Systems",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 3,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001165",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "유닉스응용프로그래밍",
+       "name_en": "Advanced UNIX Programming",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 3,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001169",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "임베디드시스템",
+       "name_en": "Embedded Systems",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 3,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001173",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "컴퓨터비전개론",
+       "name_en": "Introduction to Computer Vision",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 3,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001614",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "그래프데이터분석",
+       "name_en": "Data Analytics for Graphs",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 3,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001178",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "데이터마이닝",
+       "name_en": "Data Mining",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 3,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001167",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "데이터베이스",
+       "name_en": "Databases",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 3,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001615",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "딥러닝프로그래밍",
+       "name_en": "Programming for Deep Learning",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 3,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001168",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "소프트웨어공학",
+       "name_en": "Software Engineering",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 3,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001616",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "인공지능융합설계및실험",
+       "name_en": "Artificial Intelligence Design & Lab",
+       "credits": 3.0,
+       "lecture_hours": 0.0,
+       "practice_hours": 6.0,
+       "grade": 3,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001171",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "컴퓨터그래픽스",
+       "name_en": "Computer graphics",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 3,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001172",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "컴퓨터네트워크",
+       "name_en": "Computer Networks",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 3,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2002525",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "컴퓨터알고리즘실무",
+       "name_en": "Advanced Computer Algorithm Practice",
+       "credits": 2.0,
+       "lecture_hours": 1.0,
+       "practice_hours": 2.0,
+       "grade": 3,
+       "semesters": [
+        "여름도약"
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001179",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "가상현실개론",
+       "name_en": "Introduction to Virtual Reality",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 4,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001617",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "빅데이터분석설계및실험",
+       "name_en": "Big Data Analysis Design & Lab",
+       "credits": 3.0,
+       "lecture_hours": 0.0,
+       "practice_hours": 6.0,
+       "grade": 4,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001181",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "산학협력실무",
+       "name_en": "Industry-Academy Cooperation Practice",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": null,
+       "semesters": [
+        1,
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001618",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "생성모델",
+       "name_en": "Foundations of Generative AI",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 4,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001619",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "시각컴퓨팅",
+       "name_en": "Visual Computing",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 4,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001175",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "임베디드소프트웨어설계",
+       "name_en": "Embedded Software Design",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 4,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001174",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "자연어처리",
+       "name_en": "Natural Language Processing",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 4,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001621",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "클라우드컴퓨팅",
+       "name_en": "Cloud Computing",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 4,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001177",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "프로그래밍언어론",
+       "name_en": "Programming Language principles",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 4,
+       "semesters": [
+        1
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001180",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "강화학습개론",
+       "name_en": "Introduction to Reinforcement Learning",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 4,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001622",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "멀티모달딥러닝",
+       "name_en": "Multimodal Deep Learning",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 4,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001623",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "인간컴퓨터상호작용",
+       "name_en": "Human Computer Interaction",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 4,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001624",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "정보검색및추천시스템",
+       "name_en": "Information Retrieval and Recommendation Systems",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 4,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      },
+      {
+       "code": "CA2001620",
+       "area": "전공",
+       "category": "전공선택",
+       "name_ko": "지능형IoT플랫폼",
+       "name_en": "Intelligent IoT Platform",
+       "credits": 3.0,
+       "lecture_hours": 3.0,
+       "practice_hours": 0.0,
+       "grade": 4,
+       "semesters": [
+        2
+       ],
+       "minor_required": false,
+       "minimum_major_required": false
+      }
+     ],
+     "liberal_areas": [
+      {
+       "category": "효원균형교양",
+       "code": "ZFz000091",
+       "area": "Ⅰ. ‘사상과 역사’ 영역"
+      },
+      {
+       "category": "효원균형교양",
+       "code": "ZFz000092",
+       "area": "Ⅱ. ‘사회와 문화’ 영역"
+      },
+      {
+       "category": "효원균형교양",
+       "code": "ZFz000093",
+       "area": "Ⅲ. ‘문학과 예술’ 영역"
+      },
+      {
+       "category": "효원균형교양",
+       "code": "ZFz000094",
+       "area": "Ⅳ. ‘과학과 기술’ 영역"
+      },
+      {
+       "category": "효원균형교양",
+       "code": "ZFz000096",
+       "area": "Ⅵ. ‘세계와 소통’ 영역"
+      },
+      {
+       "category": "효원균형교양",
+       "code": "ZFz000098",
+       "area": "Ⅷ. ‘효원브릿지’영역"
+      },
+      {
+       "category": "효원창의교양",
+       "code": "ZFz000095",
+       "area": "Ⅴ. ‘건강과 레포츠’ 영역"
+      },
+      {
+       "category": "효원창의교양",
+       "code": "ZFz000097",
+       "area": "Ⅶ. ‘융합과 창의’ 영역"
+      },
+      {
+       "category": "효원창의교양",
+       "code": "ZFz000110",
+       "area": "Ⅸ. ‘인성과 사회봉사’ 영역"
+      }
+     ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pnu-ai-curriculum-mcp
+  labels:
+    app: pnu-ai-curriculum-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pnu-ai-curriculum-mcp
+  template:
+    metadata:
+      labels:
+        app: pnu-ai-curriculum-mcp
+    spec:
+      containers:
+        - name: server
+          image: registry.access.redhat.com/ubi9/python-312:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - pip install --no-cache-dir "mcp==2.3.0" && exec python /app/server.py
+          env:
+            - name: PORT
+              value: "8000"
+            - name: CURRICULUM_FILE
+              value: /app/curriculum.json
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: src
+              mountPath: /app
+      volumes:
+        - name: src
+          configMap:
+            name: pnu-ai-curriculum-mcp-src
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pnu-ai-curriculum-mcp
+  labels:
+    app: pnu-ai-curriculum-mcp
+spec:
+  selector:
+    app: pnu-ai-curriculum-mcp
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

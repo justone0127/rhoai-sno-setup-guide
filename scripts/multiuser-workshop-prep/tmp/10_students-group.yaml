@@ -1,0 +1,39 @@
+# 워크샵 수강생 그룹 (user1 ~ user30)
+# 사용법: oc apply -f 10_students-group.yaml  (또는 bash 10_create-students-group.sh — 기존 멤버 유지)
+# 주의: oc apply는 users 목록을 이 파일 내용으로 덮어씁니다 (수동으로 추가한 멤버는 빠짐).
+---
+apiVersion: user.openshift.io/v1
+kind: Group
+metadata:
+  name: students
+users:
+  - user1
+  - user2
+  - user3
+  - user4
+  - user5
+  - user6
+  - user7
+  - user8
+  - user9
+  - user10
+  - user11
+  - user12
+  - user13
+  - user14
+  - user15
+  - user16
+  - user17
+  - user18
+  - user19
+  - user20
+  - user21
+  - user22
+  - user23
+  - user24
+  - user25
+  - user26
+  - user27
+  - user28
+  - user29
+  - user30

@@ -1,0 +1,797 @@
+# 조선대학교 인공지능공학전공 교육과정 조회 MCP 서버
+# 공용 서버: 클러스터에 1개만 배포하고 모든 수강생이 함께 사용합니다.
+# 배포: bash 11_deploy-curriculum-mcp.sh --mcp curriculum-mcp  (mcp-servers 네임스페이스 + students 그룹 view 권한)
+# 접속: http://curriculum-mcp.mcp-servers.svc.cluster.local:8000/mcp
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: curriculum-mcp-src
+  labels:
+    app: curriculum-mcp
+data:
+  server.py: |
+    """인공지능공학전공 교육과정 조회 MCP 서버 (Streamable HTTP)."""
+    import json
+    import os
+    from collections import defaultdict
+
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    DATA_FILE = os.environ.get("COURSES_FILE", os.path.join(os.path.dirname(__file__), "courses.json"))
+    with open(DATA_FILE, encoding="utf-8") as f:
+        COURSES = json.load(f)
+
+    CATEGORIES = sorted({c["category"] for c in COURSES})
+
+    mcp = MCPServer(
+        name="curriculum",
+        instructions=(
+            "조선대학교 AI소프트웨어학부 인공지능공학전공의 교육과정(학년/학기별 개설 과목, 이수구분, 학점, "
+            "강의·실습 시간)을 조회하는 도구입니다. 교육과정에 관한 질문은 추측하지 말고 이 도구로 확인하세요."
+        ),
+    )
+
+
+    def _num(x: float) -> str:
+        return str(int(x)) if x == int(x) else str(x)
+
+
+    def _fmt(c: dict) -> str:
+        return (f"- {c['grade']}학년 {c['semester']}학기 | {c['category']} | {c['name_ko']} ({c['name_en']}) | "
+                f"{_num(c['credits'])}학점 | 강의 {_num(c['lecture_hours'])}시간, 실습 {_num(c['practice_hours'])}시간")
+
+
+    def _norm(s: str) -> str:
+        return "".join(s.split()).lower()
+
+
+    @mcp.tool()
+    def search_courses(keyword: str) -> str:
+        """과목명(국문 또는 영문)에 키워드가 포함된 과목을 찾습니다.
+        과목이 몇 학년 몇 학기에 개설되는지, 몇 학점인지, 이수구분이 무엇인지 확인할 때 사용합니다.
+
+        Args:
+            keyword: 찾을 과목명 또는 그 일부 (예: "딥러닝", "클라우드", "machine learning")
+        """
+        k = _norm(keyword)
+        hits = [c for c in COURSES if k in _norm(c["name_ko"]) or k in _norm(c["name_en"])]
+        if not hits:
+            return f"'{keyword}'(이)가 포함된 과목이 교육과정에 없습니다."
+        return f"'{keyword}' 검색 결과 {len(hits)}개 과목:\n" + "\n".join(_fmt(c) for c in hits)
+
+
+    @mcp.tool()
+    def list_courses(grade: int | None = None, semester: int | None = None, category: str | None = None) -> str:
+        """조건에 맞는 과목 목록을 반환합니다. 조건을 생략하면 해당 조건은 전체로 간주합니다.
+
+        Args:
+            grade: 학년 (1~4)
+            semester: 학기 (1 또는 2)
+            category: 이수구분. 교양필수, 교양선택, 전공필수, 전공선택, SW선택형전공필수 중 하나
+        """
+        if category and category not in CATEGORIES:
+            return f"알 수 없는 이수구분입니다: {category}. 사용 가능한 값: {', '.join(CATEGORIES)}"
+        hits = [c for c in COURSES
+                if (grade is None or c["grade"] == grade)
+                and (semester is None or c["semester"] == semester)
+                and (category is None or c["category"] == category)]
+        cond = " ".join(x for x in [f"{grade}학년" if grade else "", f"{semester}학기" if semester else "",
+                                    category or ""] if x) or "전체"
+        if not hits:
+            return f"조건({cond})에 맞는 과목이 없습니다."
+        total = sum(c["credits"] for c in hits)
+        return f"조건({cond})에 맞는 과목 {len(hits)}개, 합계 {_num(total)}학점:\n" + "\n".join(_fmt(c) for c in hits)
+
+
+    @mcp.tool()
+    def credit_summary(grade: int | None = None, semester: int | None = None) -> str:
+        """개설 과목 수와 학점 합계를 이수구분별로 집계합니다.
+        이 값은 개설된 과목의 합계이며 졸업 이수 학점이 아닙니다.
+
+        Args:
+            grade: 학년 (1~4). 생략하면 전체 학년
+            semester: 학기 (1 또는 2). 생략하면 전체 학기
+        """
+        hits = [c for c in COURSES
+                if (grade is None or c["grade"] == grade) and (semester is None or c["semester"] == semester)]
+        if not hits:
+            return "조건에 맞는 과목이 없습니다."
+        by = defaultdict(lambda: [0, 0.0])
+        for c in hits:
+            by[c["category"]][0] += 1
+            by[c["category"]][1] += c["credits"]
+        scope = " ".join(x for x in [f"{grade}학년" if grade else "", f"{semester}학기" if semester else ""] if x) or "전체"
+        lines = [f"{scope}: 총 {len(hits)}개 과목, {_num(sum(c['credits'] for c in hits))}학점 (개설 과목 합계이며 졸업 학점 아님)"]
+        lines += [f"- {k}: {v[0]}개 과목, {_num(v[1])}학점" for k, v in sorted(by.items())]
+        return "\n".join(lines)
+
+
+    if __name__ == "__main__":
+        mcp.run(
+            transport="streamable-http",
+            host="0.0.0.0",
+            port=int(os.environ.get("PORT", "8000")),
+            stateless_http=True,
+            json_response=True,
+            # 클러스터 내부 Service DNS 이름으로 접근하므로 DNS rebinding 보호를 끕니다 (실습용)
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        )
+  courses.json: |
+    [
+     {
+      "grade": 1,
+      "semester": 1,
+      "category": "교양선택",
+      "name_ko": "(EGC-A)Science and Literacy",
+      "name_en": "SCIENCE AND LITERACY",
+      "credits": 2.0,
+      "lecture_hours": 0.0,
+      "practice_hours": 3.0
+     },
+     {
+      "grade": 1,
+      "semester": 1,
+      "category": "교양선택",
+      "name_ko": "EGC",
+      "name_en": "ENGLISH FOR GLOBAL COMMUNICATION",
+      "credits": 2.0,
+      "lecture_hours": 0.0,
+      "practice_hours": 3.0
+     },
+     {
+      "grade": 1,
+      "semester": 1,
+      "category": "교양필수",
+      "name_ko": "미분적분학",
+      "name_en": "CALCULUS",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 1,
+      "semester": 1,
+      "category": "교양필수",
+      "name_ko": "신입생세미나(나의삶,나의진로)",
+      "name_en": "FRESHMAN SEMINAR",
+      "credits": 1.0,
+      "lecture_hours": 1.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 1,
+      "semester": 1,
+      "category": "교양필수",
+      "name_ko": "프로그래밍언어및실습",
+      "name_en": "PROGRAMMING LANGUAGE AND LAB",
+      "credits": 3.0,
+      "lecture_hours": 2.0,
+      "practice_hours": 2.0
+     },
+     {
+      "grade": 1,
+      "semester": 1,
+      "category": "교양필수",
+      "name_ko": "확률과통계",
+      "name_en": "PROBABILITY & STATISTICS",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 1,
+      "semester": 1,
+      "category": "전공필수",
+      "name_ko": "기초프로그래밍",
+      "name_en": "BASIC PROGRAMMING",
+      "credits": 3.0,
+      "lecture_hours": 2.0,
+      "practice_hours": 2.0
+     },
+     {
+      "grade": 1,
+      "semester": 2,
+      "category": "교양선택",
+      "name_ko": "(EAL-A)삶과4차산업혁명",
+      "name_en": "LIFE AND THE FOURTH INDUSTRIAL REVOLUTION",
+      "credits": 2.0,
+      "lecture_hours": 2.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 1,
+      "semester": 2,
+      "category": "교양선택",
+      "name_ko": "EAL",
+      "name_en": "ENGLISH FOR ACADEMIC LEARNING",
+      "credits": 2.0,
+      "lecture_hours": 2.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 1,
+      "semester": 2,
+      "category": "교양필수",
+      "name_ko": "말하기와실용글쓰기",
+      "name_en": "SPEAKING AND PRACTICAL WRITING",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 1,
+      "semester": 2,
+      "category": "교양필수",
+      "name_ko": "선형대수학",
+      "name_en": "LINEAR ALGEBRA",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 1,
+      "semester": 2,
+      "category": "전공선택",
+      "name_ko": "AI프로그래밍및실습",
+      "name_en": "AI PROGRAMMING AND PRACTICE",
+      "credits": 3.0,
+      "lecture_hours": 2.0,
+      "practice_hours": 2.0
+     },
+     {
+      "grade": 1,
+      "semester": 2,
+      "category": "전공선택",
+      "name_ko": "인공지능",
+      "name_en": "ARTIFICIAL INTELLIGENCE",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 1,
+      "semester": 2,
+      "category": "전공필수",
+      "name_ko": "심화프로그래밍",
+      "name_en": "ADVANCED PROGRAMMING",
+      "credits": 2.0,
+      "lecture_hours": 0.0,
+      "practice_hours": 3.0
+     },
+     {
+      "grade": 2,
+      "semester": 1,
+      "category": "전공선택",
+      "name_ko": "AI신호및시스템",
+      "name_en": "AI SIGNALS AND SYSTEMS",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 2,
+      "semester": 1,
+      "category": "전공선택",
+      "name_ko": "기계학습",
+      "name_en": "MACHINE LEARNING",
+      "credits": 3.0,
+      "lecture_hours": 2.0,
+      "practice_hours": 2.0
+     },
+     {
+      "grade": 2,
+      "semester": 1,
+      "category": "전공선택",
+      "name_ko": "신기술산업체현장실습1",
+      "name_en": "NEW TECHNOLOGY INDUSTRY FIELD STUDY1",
+      "credits": 3.0,
+      "lecture_hours": 0.0,
+      "practice_hours": 3.0
+     },
+     {
+      "grade": 2,
+      "semester": 1,
+      "category": "전공선택",
+      "name_ko": "오픈소스SW개론",
+      "name_en": "INTRODUCTION TO OPEN SOURCE SW",
+      "credits": 3.0,
+      "lecture_hours": 2.0,
+      "practice_hours": 2.0
+     },
+     {
+      "grade": 2,
+      "semester": 1,
+      "category": "전공필수",
+      "name_ko": "객체지향프로그래밍",
+      "name_en": "OBJECT ORIENTED PROGRAMMING",
+      "credits": 3.0,
+      "lecture_hours": 2.0,
+      "practice_hours": 2.0
+     },
+     {
+      "grade": 2,
+      "semester": 1,
+      "category": "전공필수",
+      "name_ko": "데이터구조",
+      "name_en": "DATA STRUCTURE",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 2,
+      "semester": 2,
+      "category": "교양필수",
+      "name_ko": "수치해석",
+      "name_en": "NUMERICAL ANALYSIS",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 2,
+      "semester": 2,
+      "category": "전공선택",
+      "name_ko": "Kakao Cloud AI 서비스개발",
+      "name_en": "KAKAO CLOUD AI SERVICE DEVELOPMENT",
+      "credits": 3.0,
+      "lecture_hours": 1.0,
+      "practice_hours": 2.0
+     },
+     {
+      "grade": 2,
+      "semester": 2,
+      "category": "전공선택",
+      "name_ko": "데이터과학",
+      "name_en": "INTRODUCTION TO DATA SCIENCE",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 2,
+      "semester": 2,
+      "category": "전공선택",
+      "name_ko": "신기술산업체현장실습2",
+      "name_en": "NEW TECHNOLOGY INDUSTRY FIELD STUDY 2",
+      "credits": 3.0,
+      "lecture_hours": 0.0,
+      "practice_hours": 3.0
+     },
+     {
+      "grade": 2,
+      "semester": 2,
+      "category": "전공필수",
+      "name_ko": "알고리즘",
+      "name_en": "ALGORITHMS",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 2,
+      "semester": 2,
+      "category": "전공필수",
+      "name_ko": "운영체제",
+      "name_en": "OPERATING SYSTEMS",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 2,
+      "semester": 2,
+      "category": "전공필수",
+      "name_ko": "자바프로그래밍",
+      "name_en": "JAVA PROGRAMMING",
+      "credits": 3.0,
+      "lecture_hours": 2.0,
+      "practice_hours": 2.0
+     },
+     {
+      "grade": 3,
+      "semester": 1,
+      "category": "전공선택",
+      "name_ko": "AI디지털미디어",
+      "name_en": "AI DIGITAL MEDIA",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 3,
+      "semester": 1,
+      "category": "전공선택",
+      "name_ko": "딥러닝기초",
+      "name_en": "FUNDAMENTALS OF DEEP LEARNING",
+      "credits": 3.0,
+      "lecture_hours": 1.5,
+      "practice_hours": 1.5
+     },
+     {
+      "grade": 3,
+      "semester": 1,
+      "category": "전공선택",
+      "name_ko": "자연어처리",
+      "name_en": "NATURAL LANGUAGE PROCESSING",
+      "credits": 3.0,
+      "lecture_hours": 2.0,
+      "practice_hours": 2.0
+     },
+     {
+      "grade": 3,
+      "semester": 1,
+      "category": "전공필수",
+      "name_ko": "컴퓨터구조",
+      "name_en": "COMPUTER ARCHITECTURE",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 3,
+      "semester": 1,
+      "category": "전공필수",
+      "name_ko": "컴퓨터네트워크",
+      "name_en": "COMPUTER NETWORKS",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 3,
+      "semester": 2,
+      "category": "SW선택형전공필수",
+      "name_ko": "(기업주도)AI클라우드컴퓨팅",
+      "name_en": "(INDUSTRY-LED)AI CLOUD COMPUTING",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 3,
+      "semester": 2,
+      "category": "SW선택형전공필수",
+      "name_ko": "(기업주도)자동차임베디드소프트웨어설계",
+      "name_en": "(INDUSTRY-LED) AUTOMOTIVE EMBEDDED SOFTWARE DESIGN",
+      "credits": 3.0,
+      "lecture_hours": 1.5,
+      "practice_hours": 1.5
+     },
+     {
+      "grade": 3,
+      "semester": 2,
+      "category": "전공선택",
+      "name_ko": "AI임베디드시스템",
+      "name_en": "AI EMBEDDED SYSTEM",
+      "credits": 3.0,
+      "lecture_hours": 2.0,
+      "practice_hours": 2.0
+     },
+     {
+      "grade": 3,
+      "semester": 2,
+      "category": "전공선택",
+      "name_ko": "네트워크보안",
+      "name_en": "NETWORK SECURITY",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 3,
+      "semester": 2,
+      "category": "전공선택",
+      "name_ko": "딥러닝심화",
+      "name_en": "ADVANCED DEEP LEARNING",
+      "credits": 3.0,
+      "lecture_hours": 2.0,
+      "practice_hours": 2.0
+     },
+     {
+      "grade": 3,
+      "semester": 2,
+      "category": "전공선택",
+      "name_ko": "빅데이터분석",
+      "name_en": "BIG DATA ANALYSIS",
+      "credits": 3.0,
+      "lecture_hours": 2.0,
+      "practice_hours": 2.0
+     },
+     {
+      "grade": 3,
+      "semester": 2,
+      "category": "전공선택",
+      "name_ko": "시스템보안",
+      "name_en": "SYSTEM SECURITY",
+      "credits": 3.0,
+      "lecture_hours": 2.0,
+      "practice_hours": 2.0
+     },
+     {
+      "grade": 3,
+      "semester": 2,
+      "category": "전공선택",
+      "name_ko": "컴퓨터비전개론",
+      "name_en": "INTRODUCTION TO COMPUTER VISION",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 3,
+      "semester": 2,
+      "category": "전공필수",
+      "name_ko": "데이터베이스",
+      "name_en": "DATABASE",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 4,
+      "semester": 1,
+      "category": "SW선택형전공필수",
+      "name_ko": "(기업주도)UNITY기반실감콘텐츠프로젝트실무",
+      "name_en": "(INDUSTRY-LED)PRACTICAL PROJECT IN UNITY-BASED IMMERSIVE CONTENT DEVELOPMENT",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 4,
+      "semester": 1,
+      "category": "SW선택형전공필수",
+      "name_ko": "(기업주도)자동차SW설계",
+      "name_en": "(INDUSTRY-LED)AUTOMOTIVE SW DESIGN",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 4,
+      "semester": 1,
+      "category": "SW선택형전공필수",
+      "name_ko": "(기업주도)자동차전장제어기회로응용설계",
+      "name_en": "(INDUSTRY-LED)HARDWARE DESIGN FOR AUTOMOTIVE ELECTRONIC CONTROL UNITS",
+      "credits": 3.0,
+      "lecture_hours": 2.0,
+      "practice_hours": 1.0
+     },
+     {
+      "grade": 4,
+      "semester": 1,
+      "category": "SW선택형전공필수",
+      "name_ko": "NHN SW프로젝트",
+      "name_en": "NHN SW PROJECT",
+      "credits": 12.0,
+      "lecture_hours": 6.0,
+      "practice_hours": 12.0
+     },
+     {
+      "grade": 4,
+      "semester": 1,
+      "category": "SW선택형전공필수",
+      "name_ko": "단기인턴십",
+      "name_en": "SHORT-TERM INTERNSHIP",
+      "credits": 3.0,
+      "lecture_hours": 0.0,
+      "practice_hours": 6.0
+     },
+     {
+      "grade": 4,
+      "semester": 1,
+      "category": "전공선택",
+      "name_ko": "AI음성신호처리",
+      "name_en": "AI SPEECH SIGNAL PROCESSING",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 4,
+      "semester": 1,
+      "category": "전공선택",
+      "name_ko": "AI헬스케어",
+      "name_en": "AI HEALTH CARE",
+      "credits": 3.0,
+      "lecture_hours": 2.0,
+      "practice_hours": 2.0
+     },
+     {
+      "grade": 4,
+      "semester": 1,
+      "category": "전공선택",
+      "name_ko": "강화학습이해",
+      "name_en": "INTRODUCTION TO REINFORCEMENT LEARNING",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 4,
+      "semester": 1,
+      "category": "전공선택",
+      "name_ko": "산업체특강1",
+      "name_en": "INDUSTRIAL EXPERT SEMINARS 1",
+      "credits": 1.0,
+      "lecture_hours": 1.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 4,
+      "semester": 1,
+      "category": "전공선택",
+      "name_ko": "클라우드및가상화",
+      "name_en": "CLOUD AND VIRTUALIZATION",
+      "credits": 3.0,
+      "lecture_hours": 0.0,
+      "practice_hours": 3.0
+     },
+     {
+      "grade": 4,
+      "semester": 1,
+      "category": "전공필수",
+      "name_ko": "산학프로젝트1",
+      "name_en": "INDUSTRY-ACADEMIA PROJECT1",
+      "credits": 3.0,
+      "lecture_hours": 0.0,
+      "practice_hours": 3.0
+     },
+     {
+      "grade": 4,
+      "semester": 2,
+      "category": "SW선택형전공필수",
+      "name_ko": "(기업주도)ARVR메타버스",
+      "name_en": "CORPORATE-LED AR/VR METAVERSE",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 4,
+      "semester": 2,
+      "category": "SW선택형전공필수",
+      "name_ko": "(기업주도)오픈소스 AI플랫폼 엔지니어링",
+      "name_en": "(INDUSTRY-LED)OPEN SOURCE AI PLATFORM ENGINEERING",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 4,
+      "semester": 2,
+      "category": "SW선택형전공필수",
+      "name_ko": "AI응용프로젝트",
+      "name_en": "AI APPLICATION PROJECT",
+      "credits": 12.0,
+      "lecture_hours": 6.0,
+      "practice_hours": 12.0
+     },
+     {
+      "grade": 4,
+      "semester": 2,
+      "category": "SW선택형전공필수",
+      "name_ko": "산학프로젝트2",
+      "name_en": "INDUSTRY-ACADEMIA PROJECT 2",
+      "credits": 3.0,
+      "lecture_hours": 0.0,
+      "practice_hours": 3.0
+     },
+     {
+      "grade": 4,
+      "semester": 2,
+      "category": "SW선택형전공필수",
+      "name_ko": "신기술SW창업프로젝트",
+      "name_en": "NEW-TECH. SW STARTUP PROJECT",
+      "credits": 3.0,
+      "lecture_hours": 0.0,
+      "practice_hours": 3.0
+     },
+     {
+      "grade": 4,
+      "semester": 2,
+      "category": "SW선택형전공필수",
+      "name_ko": "중기인턴십",
+      "name_en": "MIDDLE INTERNSHIPS",
+      "credits": 12.0,
+      "lecture_hours": 0.0,
+      "practice_hours": 24.0
+     },
+     {
+      "grade": 4,
+      "semester": 2,
+      "category": "전공선택",
+      "name_ko": "AI실무프로젝트",
+      "name_en": "AI PRACTICE PROJECT",
+      "credits": 9.0,
+      "lecture_hours": 4.0,
+      "practice_hours": 5.0
+     },
+     {
+      "grade": 4,
+      "semester": 2,
+      "category": "전공선택",
+      "name_ko": "산업체특강2",
+      "name_en": "INDUSTRIAL EXPERT SEMINARS 2",
+      "credits": 1.0,
+      "lecture_hours": 1.0,
+      "practice_hours": 0.0
+     },
+     {
+      "grade": 4,
+      "semester": 2,
+      "category": "전공선택",
+      "name_ko": "인간과컴퓨터상호작용",
+      "name_en": "HUMAN COMPUTER INTERACTION",
+      "credits": 3.0,
+      "lecture_hours": 3.0,
+      "practice_hours": 0.0
+     }
+    ]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: curriculum-mcp
+  labels:
+    app: curriculum-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: curriculum-mcp
+  template:
+    metadata:
+      labels:
+        app: curriculum-mcp
+    spec:
+      containers:
+        - name: server
+          image: registry.access.redhat.com/ubi9/python-312:latest
+          command: ["/bin/bash", "-c"]
+          args:
+            - pip install --no-cache-dir "mcp==2.3.0" && exec python /app/server.py
+          env:
+            - name: PORT
+              value: "8000"
+            - name: COURSES_FILE
+              value: /app/courses.json
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: src
+              mountPath: /app
+      volumes:
+        - name: src
+          configMap:
+            name: curriculum-mcp-src
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: curriculum-mcp
+  labels:
+    app: curriculum-mcp
+spec:
+  selector:
+    app: curriculum-mcp
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
