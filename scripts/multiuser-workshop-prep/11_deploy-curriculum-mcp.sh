@@ -12,10 +12,14 @@
 #   1. Create namespace (default: mcp-servers)
 #   2. oc apply the selected MCP YAML(s) -n <namespace>
 #   3. Wait for the Deployment rollout
-#   4. oc adm policy add-role-to-group view <group> -n <namespace>
+#   4. Register the MCP in the RHOAI dashboard (AI asset endpoints → MCP
+#      servers) via ConfigMap gen-ai-aa-mcp-servers in redhat-ods-applications
+#      (Technology Preview). Other entries in that ConfigMap are kept.
+#   5. oc adm policy add-role-to-group view <group> -n <namespace>
 #
 # Students get the "view" role only — they can see the project, pods, logs
 # and services but cannot change the shared servers.
+# --remove deletes the MCP and its dashboard entry.
 #
 # Run as cluster-admin. Re-running is safe.
 #
@@ -38,6 +42,7 @@
 #   --role          view
 #   --timeout       300s   (rollout wait; first start runs pip install)
 #   --skip-deploy   only create namespace + role binding
+#   --no-dashboard  do not register/unregister in the RHOAI dashboard
 ###############################################################################
 set -euo pipefail
 
@@ -50,6 +55,9 @@ SELECT=""
 REMOVE=""
 LIST=false
 SKIP_DEPLOY=false
+DASHBOARD=true
+DASH_NS="redhat-ods-applications"
+DASH_CM="gen-ai-aa-mcp-servers"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -61,7 +69,8 @@ while [[ $# -gt 0 ]]; do
         --role)          ROLE="$2"; shift 2 ;;
         --timeout)       TIMEOUT="$2"; shift 2 ;;
         --skip-deploy)   SKIP_DEPLOY=true; shift ;;
-        --help|-h)       sed -n '3,42p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --no-dashboard)  DASHBOARD=false; shift ;;
+        --help|-h)       sed -n '3,47p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -110,6 +119,37 @@ resolve() {
     done
 }
 
+desc_of() {
+    local i
+    for i in "${!NAMES[@]}"; do
+        [ "${NAMES[$i]}" = "$1" ] && { echo "${DESCS[$i]}"; return 0; }
+    done
+}
+
+# RHOAI dashboard: one key per MCP in ConfigMap gen-ai-aa-mcp-servers.
+# JSON merge patch keeps the other keys (e.g. MCPs registered by hand).
+dashboard_register() {
+    local n="$1" url desc value
+    url="http://${n}.${NAMESPACE}.svc.cluster.local:8000/mcp"
+    desc="$(desc_of "$n" | sed 's/["\\]//g')"
+    value="{\\\"url\\\": \\\"${url}\\\", \\\"description\\\": \\\"${desc}\\\"}"
+    if ! oc get configmap "$DASH_CM" -n "$DASH_NS" &>/dev/null; then
+        oc create configmap "$DASH_CM" -n "$DASH_NS" >/dev/null
+        info "Created ConfigMap ${DASH_CM} in ${DASH_NS}"
+    fi
+    oc patch configmap "$DASH_CM" -n "$DASH_NS" --type=merge \
+        -p "{\"data\":{\"${n}\":\"${value}\"}}" >/dev/null
+    success "Dashboard: registered ${n} → ${url}"
+}
+
+dashboard_unregister() {
+    local n="$1"
+    oc get configmap "$DASH_CM" -n "$DASH_NS" &>/dev/null || return 0
+    oc patch configmap "$DASH_CM" -n "$DASH_NS" --type=merge \
+        -p "{\"data\":{\"${n}\":null}}" >/dev/null
+    success "Dashboard: unregistered ${n}"
+}
+
 print_catalog() {
     local i state
     for i in "${!NAMES[@]}"; do
@@ -145,6 +185,7 @@ if [ -n "$REMOVE" ]; then
     for n in $(resolve "$REMOVE"); do
         oc delete -f "$(file_of "$n")" -n "$NAMESPACE" --ignore-not-found
         success "Removed ${n}"
+        [ "$DASHBOARD" = true ] && dashboard_unregister "$n"
     done
     echo ""
     info "Remaining:"
@@ -223,7 +264,19 @@ done
 echo ""
 
 ###############################################################################
-# 4. Role binding for students
+# 4. RHOAI dashboard registration (AI asset endpoints → MCP servers)
+###############################################################################
+if [ "$DASHBOARD" = true ] && [ ${#SELECTED[@]} -gt 0 ]; then
+    if oc get namespace "$DASH_NS" &>/dev/null; then
+        for n in "${SELECTED[@]}"; do dashboard_register "$n"; done
+    else
+        warn "Namespace ${DASH_NS} not found — is RHOAI installed? Skipping dashboard registration"
+    fi
+    echo ""
+fi
+
+###############################################################################
+# 5. Role binding for students
 ###############################################################################
 if ! oc get group "$GROUP" &>/dev/null; then
     warn "Group '${GROUP}' does not exist yet — binding anyway; it takes effect once the group is created"
