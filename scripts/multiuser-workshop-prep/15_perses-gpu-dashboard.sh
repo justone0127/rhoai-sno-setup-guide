@@ -13,8 +13,11 @@
 #   1. Installs the Cluster Observability Operator (COO) if missing
 #      (namespace openshift-cluster-observability-operator, channel stable).
 #   2. Creates/patches UIPlugin "monitoring" with spec.monitoring.perses.enabled.
-#   3. Creates namespace gpu-monitoring and a PersesDashboard CR in it.
-#      The panels use the default Prometheus datasource (cluster Thanos Querier).
+#   3. Creates a Thanos Querier datasource (Perses has none by default):
+#      PersesGlobalDatasource thanos-querier-global-datasource (cluster-wide,
+#      default) — or a PersesDatasource in the namespace if that CRD is missing.
+#      Skipped when another PersesGlobalDatasource already exists.
+#   3b.Creates namespace gpu-monitoring and a PersesDashboard CR in it.
 #   4. Optionally (--group) lets a group view (or edit with --editor) the
 #      dashboards in that namespace.
 #
@@ -60,7 +63,7 @@ while [[ $# -gt 0 ]]; do
         --channel)    CHANNEL="$2"; shift 2 ;;
         --dry-run)    DRY_RUN=true; shift ;;
         --remove)     REMOVE=true; shift ;;
-        --help|-h)    sed -n '3,42p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --help|-h)    sed -n '3,45p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -510,9 +513,45 @@ subjects:
 EOF
 }
 
+# Thanos Querier datasource. Perses has no built-in default: without one the
+# panels show a datasource error and the Node variable stays empty.
+# datasource_manifest <apiVersion> <kind> <name> [namespace]
+# The operator creates the referenced secret from the service CA.
+datasource_manifest() {
+    local api="$1" kind="$2" name="$3" ns="${4:-}"
+cat <<EOF
+apiVersion: ${api}
+kind: ${kind}
+metadata:
+  name: ${name}
+$( [ -n "$ns" ] && echo "  namespace: ${ns}" )
+spec:
+  config:
+    display:
+      name: Thanos Querier
+    default: true
+    plugin:
+      kind: PrometheusDatasource
+      spec:
+        proxy:
+          kind: HTTPProxy
+          spec:
+            url: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
+            secret: ${name}-secret
+  client:
+    tls:
+      enable: true
+      caCert:
+        type: file
+        certPath: /ca/service-ca.crt
+EOF
+}
+
 if [ "$DRY_RUN" = true ]; then
     echo "# --- COO (applied only if not installed) ---"; coo_manifest
     echo "---"; uiplugin_manifest
+    echo "---"; echo "# --- applied only if no PersesGlobalDatasource exists (namespaced PersesDatasource if the CRD is missing) ---"
+    datasource_manifest perses.dev/v1alpha2 PersesGlobalDatasource thanos-querier-global-datasource
     echo "---"; printf 'apiVersion: v1\nkind: Namespace\nmetadata:\n  name: %s\n' "$NS"
     echo "---"; dashboard_manifest
     if [ -n "$GROUP" ]; then echo "---"; rbac_manifest; fi
@@ -532,7 +571,8 @@ success "Logged in: $(oc whoami) @ $(oc whoami --show-server)"
 
 if [ "$REMOVE" = true ]; then
     oc delete namespace "$NS" --ignore-not-found
-    success "Done. Namespace ${NS} (dashboard) removed. COO and UIPlugin kept."
+    success "Done. Namespace ${NS} (dashboard) removed. COO, UIPlugin and global datasource kept."
+    echo "  To remove the datasource: oc delete persesglobaldatasource thanos-querier-global-datasource"
     echo "  To disable Perses: oc patch uiplugin monitoring --type merge -p '{\"spec\":{\"monitoring\":{\"perses\":{\"enabled\":false}}}}'"
     exit 0
 fi
@@ -608,9 +648,44 @@ else
 fi
 
 ###############################################################################
-# 3. Dashboard
+# 3. Datasource (Thanos Querier)
+#    Prefer a cluster-wide PersesGlobalDatasource (all projects can use it);
+#    fall back to a PersesDatasource in ${NS} if that CRD does not exist.
 ###############################################################################
 oc get namespace "$NS" &>/dev/null || oc create namespace "$NS" >/dev/null
+
+served_version() {  # newest served version of a CRD (v1alpha2 over v1alpha1)
+    local v
+    v=$(oc get crd "$1" -o jsonpath='{.spec.versions[?(@.served==true)].name}' 2>/dev/null)
+    if echo "$v" | grep -qw v1alpha2; then echo v1alpha2
+    elif echo "$v" | grep -qw v1alpha1; then echo v1alpha1
+    fi
+}
+
+GDS_VER=$(served_version persesglobaldatasources.perses.dev)
+if [ -n "$GDS_VER" ]; then
+    EXISTING=$(oc get persesglobaldatasources -o name 2>/dev/null | grep -v thanos-querier-global-datasource || true)
+    if [ -n "$EXISTING" ]; then
+        info "PersesGlobalDatasource already exists, not adding another: ${EXISTING//$'\n'/ }"
+    else
+        datasource_manifest "perses.dev/${GDS_VER}" PersesGlobalDatasource thanos-querier-global-datasource \
+            | oc apply -f - >/dev/null
+        success "PersesGlobalDatasource thanos-querier-global-datasource applied (${GDS_VER}, default)"
+    fi
+else
+    DS_VER=$(served_version persesdatasources.perses.dev)
+    if [ -z "$DS_VER" ]; then
+        error "Neither persesglobaldatasources nor persesdatasources CRD found"
+        exit 1
+    fi
+    datasource_manifest "perses.dev/${DS_VER}" PersesDatasource thanos-querier-datasource "$NS" \
+        | oc apply -f - >/dev/null
+    success "PersesDatasource ${NS}/thanos-querier-datasource applied (${DS_VER}, default)"
+fi
+
+###############################################################################
+# 4. Dashboard
+###############################################################################
 dashboard_manifest | oc apply -f - >/dev/null
 success "PersesDashboard ${NS}/${DASH} applied"
 
